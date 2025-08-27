@@ -485,9 +485,11 @@ def check_file_mix(df: pd.DataFrame, file_path: str):
 def check_shot_comment_rule(row, rowno, file_path, abc_rule):
     """
     A/B/C 入力に基づく行別チェック（機種 40/41/42/43/44/45 のみ判定）。
-    ・C判定は「穴個数の合計」で評価（径は問わない）
-    ・合計がC未満の場合のみ、A(ショット無し想定径)での33不要判定を行う
-    ・設定で『穴詳細がφ38以上の行はショット判定しない』を適用可能
+    仕様：
+      - C判定：孔数の「合計」で評価（径は問わない）。合計が C 以上なら 33 必須。
+      - C未満：33 不要。さらに A(ショット無し想定径) を含み、かつ 板厚 >= t のとき
+               「A条件により33不要」を明示する。
+      - オプション：穴詳細に φ38 以上が含まれる行は判定対象外（ignore_nak_over_38）。
     """
     # 対象機種のみ
     try:
@@ -497,11 +499,12 @@ def check_shot_comment_rule(row, rowno, file_path, abc_rule):
     if machine not in {"40", "41", "42", "43", "44", "45"}:
         return None
 
-    # A,B,C 取得（Bは互換のため受け取るが合計判定では未使用）
+    # A,B,C,t 取得（Bは互換用でロジックでは未使用）
     try:
         a = float(abc_rule.get("a"))
         _b_unused = float(abc_rule.get("b"))
         c = int(abc_rule.get("c"))
+        t = float(abc_rule.get("t", 0))  # A条件の適用板厚しきい値（>= t）
     except Exception:
         return None
 
@@ -511,33 +514,46 @@ def check_shot_comment_rule(row, rowno, file_path, abc_rule):
             return None
 
     comment33 = str(row.get("コメント", "")).strip() == "33"
-    pairs = _parse_sizes_counts_from_row(row)  # [(径, 孔数), ...]
+
+    # 穴詳細・ドリルをまとめて (径, 個数) リスト化
+    pairs = _parse_sizes_counts_from_row(row)  # [(dia, cnt), ...]
     if not pairs:
         return None
 
-    # ★ ここを変更：C判定は穴個数の「合計」で評価
-    total_cnt = sum(int(cnt) for dia, cnt in pairs)
+    # 板厚（A条件判定に使用）
+    try:
+        thick = float(pd.to_numeric(row.get("板厚", ""), errors="coerce"))
+    except Exception:
+        thick = None
+
+    # C判定は孔数の合計で評価
+    try:
+        total_cnt = sum(int(cnt) for dia, cnt in pairs)
+    except Exception:
+        return None
 
     msgs = []
+
     if total_cnt >= c:
-        # 合計がC以上なら 33 必須
+        # 合計がC以上 → 33必須（板厚や径に関係なく）
         if not comment33:
             msgs.append(f"孔数合計{total_cnt}が{c}以上です。コメント33を入れてください。")
     else:
-        # 合計がC未満なら 33 不要
+        # 合計がC未満 → 基本 33不要
         if comment33:
             msgs.append(f"孔数合計{total_cnt}が{c}未満のためコメント33は不要です。")
 
-        # さらに A(ショット無し想定径) が含まれる場合の補足（任意だが従来ロジックを踏襲）
+        # A(φa) を含み、かつ 板厚 >= t のとき 33不要を強調（A条件適用）
         if any(abs(dia - a) <= 1e-3 for dia, _ in pairs):
-            if comment33:
-                # すでに「33不要」メッセージが入っている可能性が高いが、より具体的に補足
-                msgs.append(f"φ{a:g} はショット無し想定のためコメント33は不要です。")
+            if thick is not None and thick >= t - EPS:
+                if comment33:
+                    msgs.append(f"φ{a:g} かつ 板厚≥{t:g} のため、33は不要です。（A条件適用）")
+                else:
+                    msgs.append(f"φ{a:g} かつ 板厚≥{t:g}：A条件により33不要です。")
 
     if msgs:
         return (file_path, f"{rowno}行目: " + " / ".join(msgs))
     return None
-
     
 def _nak_has_size_over_equal(row, threshold=38.0):
     """穴詳細（中抜き）に threshold 以上の径が含まれるか判定"""
@@ -792,10 +808,6 @@ def check_csv(file_path, master_df, check_rules, abc_rule):
         # ファイル単位の混在（中抜き/ドリル）
         if check_rules.get("file_mix", True):
             errors.extend(check_file_mix(df, file_path))
-            
-        # ファイル単位の混在（中抜き/ドリル）
-        if check_rules.get("file_mix", True):
-            errors.extend(check_file_mix(df, file_path))
 
         # ★ 開先K/Vの整合性（ファイル単位）
         if check_rules.get("kakizaki_consistency", True):
@@ -921,51 +933,58 @@ class CSVCheckerApp:
         # === ショット判定（A/B/C） 入力欄：実行ボタンの「上」 ===
         abc_frame = tk.LabelFrame(self.master, text="ショット判定（A/B/C）")
         abc_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=5, pady=(4, 2))
-        
-        # ON/OFF チェックボックス（Aの前）
+
+        # 左から：ON/OFF → A → t → [spacer] → B → C → ignore(38φ)
+        # ON/OFF
         self.enable_shot_rule = tk.BooleanVar(value=self.config.get("enable_shot_rule", True))
         cb = tk.Checkbutton(abc_frame, variable=self.enable_shot_rule)  # command は後で設定
-        cb.grid(row=0, column=0, sticky="w", padx=(2, 5))
+        cb.grid(row=0, column=0, sticky="w", padx=(2, 8))
 
-        # A/B/C の変数（Entryより先に作成）
-        self.shot_no_dia_var = tk.StringVar(value=str(self.config.get("shot_abc_rule", {}).get("a", "15")))
-        self.shot_yes_dia_var = tk.StringVar(value=str(self.config.get("shot_abc_rule", {}).get("b", "18")))
-        self.shot_count_var  = tk.StringVar(value=str(self.config.get("shot_abc_rule", {}).get("c", "2")))
+        # 変数
+        self.shot_no_dia_var   = tk.StringVar(value=str(self.config.get("shot_abc_rule", {}).get("a", "15")))
+        self.shot_yes_dia_var  = tk.StringVar(value=str(self.config.get("shot_abc_rule", {}).get("b", "18")))
+        self.shot_count_var    = tk.StringVar(value=str(self.config.get("shot_abc_rule", {}).get("c", "2")))
+        self.shot_no_thick_var = tk.StringVar(value=str(self.config.get("shot_abc_rule", {}).get("t", "16")))
 
-        # A
+        # A (ショット無し)
         tk.Label(abc_frame, text="ショット無し (A) φ").grid(row=0, column=1, sticky="e")
         a_entry = tk.Entry(abc_frame, textvariable=self.shot_no_dia_var, width=8)
-        a_entry.grid(row=0, column=2, padx=(2, 80), sticky="w")
+        a_entry.grid(row=0, column=2, padx=(4, 12), sticky="w")
 
-        # B
-        tk.Label(abc_frame, text="ショット有り (B) φ").grid(row=0, column=3, sticky="e")
+        # t (A適用板厚以上)
+        tk.Label(abc_frame, text="A適用板厚以上 (t)").grid(row=0, column=3, sticky="e")
+        t_entry = tk.Entry(abc_frame, textvariable=self.shot_no_thick_var, width=8)
+        t_entry.grid(row=0, column=4, padx=(4, 12), sticky="w")
+
+        # 大きめスペース（列幅を確保）
+        abc_frame.grid_columnconfigure(5, minsize=60)  # ← ここで広めに空ける
+
+        # B (ショット有り)
+        tk.Label(abc_frame, text="ショット有り (B) φ").grid(row=0, column=6, sticky="e")
         b_entry = tk.Entry(abc_frame, textvariable=self.shot_yes_dia_var, width=8)
-        b_entry.grid(row=0, column=4, padx=(2, 12), sticky="w")
+        b_entry.grid(row=0, column=7, padx=(4, 12), sticky="w")
 
-        # C
-        tk.Label(abc_frame, text="孔個数以上 (C)").grid(row=0, column=5, sticky="e")
+        # C (孔個数以上)
+        tk.Label(abc_frame, text="孔個数以上 (C)").grid(row=0, column=8, sticky="e")
         c_entry = tk.Entry(abc_frame, textvariable=self.shot_count_var, width=8)
-        c_entry.grid(row=0, column=6, padx=(2, 12), sticky="w")
-        
-        # ★ 追加：穴詳細38φ以上はショット判定しないチェック
+        c_entry.grid(row=0, column=9, padx=(4, 12), sticky="w")
+
+        # φ38以上はショット判定しない
         self.ignore_nak_over38_var = tk.BooleanVar(
             value=self.config.get("ignore_shot_when_nak_over38", True)
         )
-
         chk_ignore_nak38 = tk.Checkbutton(
             abc_frame,
             text="中抜きショットなし(38φ以上)",
             variable=self.ignore_nak_over38_var
         )
-        chk_ignore_nak38.grid(row=0, column=7, sticky="w", padx=(16, 2))
+        chk_ignore_nak38.grid(row=0, column=10, sticky="w", padx=(16, 2))
 
-
-        # OFF時にA/B/Cをグレーアウト
+        # OFF時にA/B/C/t等をグレーアウト
         def _toggle_shot_fields():
             state = ("normal" if self.enable_shot_rule.get() else "disabled")
-            for w in (a_entry, b_entry, c_entry, chk_ignore_nak38):  # ← ここに追加
+            for w in (a_entry, t_entry, b_entry, c_entry, chk_ignore_nak38):
                 w.config(state=state)
-
 
         cb.config(command=_toggle_shot_fields)
         _toggle_shot_fields()  # 初期反映
@@ -1040,13 +1059,14 @@ class CSVCheckerApp:
             a = float(self.shot_no_dia_var.get())
             b = float(self.shot_yes_dia_var.get())
             c = int(float(self.shot_count_var.get()))  # "2.0" 等も許容してint化
+            t = float(self.shot_no_thick_var.get())
         except Exception:
             raise ValueError("A,Bは数値、Cは整数で入力してください。")
-        if a <= 0 or b <= 0 or c <= 0:
+        if a <= 0 or b <= 0 or c <= 0 or t <= 0:
             raise ValueError("A/B/Cはいずれも正の値にしてください。")
         if not (a < b):
             raise ValueError("A < B を満たしてください。")
-        return {"a": a, "b": b, "c": c}
+        return {"a": a, "b": b, "c": c, "t": t}
 
 
     def select_folder(self):
